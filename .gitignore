@@ -1,0 +1,23 @@
+# Игнорируем тяжелые папки с исходниками ядра и инструментами сборки
+kernel/
+grub_build/
+build_tool/
+toolchain/
+boot_staging/
+**/target/
+
+# Игнорируем бинарные слепки дисков и ядра
+*.ext4
+*.iso
+*.cpio.gz
+bzImage
+vmlinuz
+core.img
+init
+
+# Игнорируем мусорные файлы nano
+*.save
+*.bak
+
+# Исключение: Cargo-конфиг для статической сборки Rust ОБЯЗАН быть в Git
+!.cargo/config.toml
