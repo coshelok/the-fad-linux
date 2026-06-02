@@ -10,7 +10,7 @@ boot_staging/
 *.ext4
 *.iso
 *.cpio.gz
-build_kernel.sh
+*.bak
 vmlinuz
 init
 
