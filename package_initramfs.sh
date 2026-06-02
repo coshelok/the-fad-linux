@@ -13,10 +13,9 @@ rm -rf "$INITRAMFS_STAGE"
 mkdir -p "$INITRAMFS_STAGE"
 mkdir -p "$PROJECT_DIR/boot"
 
-# find Cs
-if [ -f "$PROJECT_DIR/init_src/init_initramfs.c" ]; then
-    INIT_SOURCE="$PROJECT_DIR/init_src/init_initramfs.c"
-elif [ -f "$PROJECT_DIR/init_src/init.c" ]; then
+# find C
+INIT_SOURCE="$PROJECT_DIR/init_src/init.c"
+if [ -f "$PROJECT_DIR/init_src/init.c" ]; then
     INIT_SOURCE="$PROJECT_DIR/init_src/init.c"
 else
     echo "[ERROR] Could not find any C init source file in init_src/!"

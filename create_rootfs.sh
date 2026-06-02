@@ -1,48 +1,187 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE}")" && pwd)"
-OUTPUT="$PROJECT_DIR/rootfs.ext4"
-ROOTFS_SIZE_MB=64
-STAGING="/tmp/fadlinux_rootfs_staging"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_DIR="$PROJECT_DIR/rootfs"
+BUILD_DIR="$PROJECT_DIR/sources"
+THREADS=$(nproc)
 
-echo "=========================================="
-echo "      Creating FAD Linux rootfs.ext4      "
-echo "=========================================="
+log() { printf "\033[1;34m[BUILD]\033[0m %s\n" "$*"; }
+die() { printf "\033[1;31m[ERROR]\033[0m %s\n" "$*"; exit 1; }
 
-rm -rf "$STAGING"
-mkdir -p "$STAGING"
+# ========== FHS Setup ==========
+log "Creating FHS directory structure in $TARGET_DIR..."
+rm -rf "$TARGET_DIR"
+mkdir -p "$TARGET_DIR"/{bin,sbin,lib,lib64,etc,proc,sys,dev,root,home,tmp,mnt,run,srv,opt,cdrom}
+mkdir -p "$TARGET_DIR"/usr/{bin,sbin,lib,include,share}
+mkdir -p "$TARGET_DIR"/var/{log,run,tmp,cache,lib/fadev/manifests}
 
-echo "[INFO] Creating standard directory tree..."
-for d in proc sys dev run mnt tmp var root home bin sbin etc; do
-    mkdir -p "$STAGING/$d"
+ln -sf usr/bin  "$TARGET_DIR/bin"
+ln -sf usr/sbin "$TARGET_DIR/sbin"
+ln -sf usr/lib  "$TARGET_DIR/lib"
+ln -sf usr/lib  "$TARGET_DIR/lib64"
+
+# ========== Build Environment ==========
+export CFLAGS="-std=gnu11 -fpermissive -Wno-error -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=old-style-definition -Wno-error=return-type -Wno-implicit-int -Wno-error=strict-prototypes"
+export CXXFLAGS="$CFLAGS"
+export CC=gcc
+export CXX=g++
+
+# ========== Package List (name|url|conf|post_install) ==========
+PKGS=(
+    "bash|https://ftp.gnu.org/gnu/bash/bash-5.2.32.tar.gz|--without-curses|ln -sf bash $TARGET_DIR/usr/bin/sh"
+    "coreutils|https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz|--enable-install-program=hostname|"
+    "grep|https://ftp.gnu.org/gnu/grep/grep-3.11.tar.xz||"
+    "sed|https://ftp.gnu.org/gnu/sed/sed-4.9.tar.xz||"
+    "gawk|https://ftp.gnu.org/gnu/gawk/gawk-5.3.0.tar.xz||"
+    "findutils|https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz||"
+    "diffutils|https://ftp.gnu.org/gnu/diffutils/diffutils-3.11.tar.xz||"
+    "tar|https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz||"
+    "gzip|https://ftp.gnu.org/gnu/gzip/gzip-1.13.tar.xz||"
+    "bzip2|https://sourceware.org/ftp/bzip2/bzip2-1.0.8.tar.gz|--prefix=/usr|"
+    "xz|https://github.com/tukaani-project/xz/releases/download/v5.6.3/xz-5.6.3.tar.xz||"
+    "make|https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz||"
+    "patch|https://ftp.gnu.org/gnu/patch/patch-2.7.6.tar.gz||"
+    )
+
+mkdir -p "$BUILD_DIR"
+
+# ========== Build Process ==========
+for entry in "${PKGS[@]}"; do
+    name=$(echo "$entry" | cut -d'|' -f1)
+    url=$(echo "$entry" | cut -d'|' -f2)
+    conf=$(echo "$entry" | cut -d'|' -f3)
+    post=$(echo "$entry" | cut -d'|' -f4)
+    log ">>> Processing $name"
+    
+    archive_name=$(basename "$url")
+    archive="$BUILD_DIR/$archive_name"
+    
+    WAS_DOWNLOADED=0
+    if [ ! -f "$archive" ]; then
+        log "  [$name] Downloading from $url..."
+        wget -q "$url" -O "$archive"
+        WAS_DOWNLOADED=1
+    else
+        log "  [$name] Archive already exists ($archive_name), skipping download."
+    fi
+    
+    dir="$BUILD_DIR/$name"
+    NEED_CONFIGURE=0
+    
+    if [ "$WAS_DOWNLOADED" -eq 1 ] || [ ! -d "$dir" ]; then
+        log "  [$name] Extracting archive..."
+        rm -rf "$dir" && mkdir -p "$dir"
+        tar -xf "$archive" -C "$dir" --strip-components=1
+        NEED_CONFIGURE=1
+    else
+        log "  [$name] Source directory already exists, using incremental build."
+    fi
+    
+    pushd "$dir" > /dev/null
+    
+    if [ -f configure ]; then
+        if [ "$NEED_CONFIGURE" -eq 1 ] || [ ! -f Makefile ]; then
+            log "  [$name] Running configure..."
+            ./configure --prefix=/usr --sysconfdir=/etc $conf
+        fi
+        log "  [$name] Running make -j$THREADS..."
+        make -j"$THREADS"
+        log "  [$name] Running make install..."
+        make DESTDIR="$TARGET_DIR" install
+    elif [ -f configure.ac ]; then
+        if [ "$NEED_CONFIGURE" -eq 1 ] || [ ! -f Makefile ]; then
+            log "  [$name] Autotools project detected. Running autoreconf & configure..."
+            autoreconf -fi
+            ./configure --prefix=/usr --sysconfdir=/etc $conf
+        fi
+        log "  [$name] Running make -j$THREADS..."
+        make -j"$THREADS"
+        log "  [$name] Running make install..."
+        make DESTDIR="$TARGET_DIR" install
+    elif [ -f Makefile ]; then
+        log "  [$name] Simple Makefile project detected. Building..."
+        log "  [$name] Running make -j$THREADS..."
+        make -j"$THREADS"
+        log "  [$name] Attempting installation via DESTDIR..."
+        if make DESTDIR="$TARGET_DIR" install; then
+            log "  [$name] Standard DESTDIR install successful."
+        else
+            log "  [$name] Standard DESTDIR install failed. Attempting manual copy..."
+            if [ "$name" = "bzip2" ]; then
+                mkdir -p "$TARGET_DIR/usr/bin" "$TARGET_DIR/usr/lib"
+                cp -v bzip2 "$TARGET_DIR/usr/bin/"
+                cp -v libbz2.a "$TARGET_DIR/usr/lib/"
+                cp -v libbz2.so "$TARGET_DIR/usr/lib/" 2>/dev/null || true
+                log "  [$name] Manual copy successful."
+            else
+                die "  [$name] Installation failed and no fallback implemented."
+            fi
+        fi
+    else
+        die "  [$name] No configure or Makefile found!"
+    fi
+
+    [ -n "$post" ] && eval "$post"
+    popd > /dev/null
+    log ">>> Finished processing $name"
 done
 
-if [ -d "$PROJECT_DIR/rust_utils" ]; then
-    echo "[INFO] Copying compiled utilities from rust_utils..."
-    # copying the binaries you have
-    find "$PROJECT_DIR/rust_utils" -type f -not -path '*/.*' -exec cp {} "$STAGING/bin/" \; 2>/dev/null || true
+# ========== Shared Libraries ==========
+log "Copying shared libraries from host (safe method)..."
+while IFS= read -r bin_file; do
+    if file "$bin_file" | grep -q "ELF"; then
+        ldd "$bin_file" 2>/dev/null | awk '/=> \// {print $3}' | while read -r lib; do
+            if [ -f "$lib" ] && [ ! -f "$TARGET_DIR/usr/lib/$(basename "$lib")" ]; then
+                cp -v "$lib" "$TARGET_DIR/usr/lib/"
+            fi
+        done
+    fi
+done < <(find "$TARGET_DIR"/usr/bin "$TARGET_DIR"/usr/sbin -type f -executable 2>/dev/null)
+ld_linux=$(ls /lib64/ld-linux-x86-64.so.2 2>/dev/null || ls /lib/ld-linux*.so* 2>/dev/null || true)
+[ -n "$ld_linux" ] && cp -v "$ld_linux" "$TARGET_DIR/usr/lib/"
+
+# ========== FAD Utilities ==========
+log "Installing custom FAD utilities..."
+
+if [ -f "$PROJECT_DIR/fad_utils/fadev" ]; then
+    cp -v "$PROJECT_DIR/fad_utils/fadev" "$TARGET_DIR/bin/fadev"
+    chmod +x "$TARGET_DIR/bin/fadev"
 fi
 
-if [ -d "$PROJECT_DIR/etc" ]; then
-    echo "[INFO] Copying configuration files to /etc..."
-    cp -a "$PROJECT_DIR/etc"/* "$STAGING/etc/" 2>/dev/null || true
+if [ -f "$PROJECT_DIR/fad_utils/fadfetch" ]; then
+    cp -v "$PROJECT_DIR/fad_utils/fadfetch" "$TARGET_DIR/bin/fadfetch"
+    chmod +x "$TARGET_DIR/bin/fadfetch"
 fi
 
-echo "[INFO] Creating essential device nodes..."
-mknod "$STAGING/dev/console" c 5 1 2>/dev/null || true
-mknod "$STAGING/dev/null" c 1 3 2>/dev/null || true
-mknod "$STAGING/dev/tty" c 5 0 2>/dev/null || true
+log "Compiling ultra-custom FAD-UI Graphical Server..."
+if [ -f "$PROJECT_DIR/fad_gui.c" ]; then
+    gcc -O3 -static "$PROJECT_DIR/fad_gui.c" -o "$TARGET_DIR/bin/fad_gui"
+    chmod +x "$TARGET_DIR/bin/fad_gui"
+    log "[SUCCESS] FAD-UI binary compiled and placed into /bin/fad_gui"
+else
+    log "[ERROR] fad_gui.c not found in project directory!"
+fi
 
-echo "[INFO] Allocating raw image space ($ROOTFS_SIZE_MB MB)..."
-dd if=/dev/zero of="$OUTPUT" bs=1M count=$ROOTFS_SIZE_MB 2>/dev/null
+# ========== System Config ==========
+log "Generating system configuration..."
+cat > "$TARGET_DIR/etc/passwd" <<EOF
+root:x:0:0:root:/root:/bin/sh
+fad:x:1000:1000:User,,,:/home/fad:/bin/sh
+EOF
 
-echo "[INFO] Formatting image as ext4..."
-mkfs.ext4 -F -L "fadroot" -d "$STAGING" "$OUTPUT" 2>&1 | tail -n 3
+cat > "$TARGET_DIR/etc/shadow" <<EOF
+root::19701:0:99999:7:::
+fad::19701:0:99999:7:::
+EOF
 
-rm -rf "$STAGING"
+cat > "$TARGET_DIR/etc/fstab" <<EOF
+tmpfs    /run      tmpfs       defaults        0  0
+tmpfs    /tmp      tmpfs       defaults        0  0
+EOF
 
-echo "[SUCCESS] rootfs.ext4 successfully created!"
-echo "Location: $OUTPUT"
-ls -lh "$OUTPUT"
+echo "fadlinux" > "$TARGET_DIR/etc/hostname"
+echo "/usr/lib" > "$TARGET_DIR/etc/ld.so.conf"
 
+log "Rootfs build complete! Target: $TARGET_DIR"

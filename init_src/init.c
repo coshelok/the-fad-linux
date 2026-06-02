@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 
 void log_info(const char *fmt, ...) {
     va_list args;
@@ -50,14 +51,12 @@ int main() {
         }
     }
 
-    mount_fs("proc", "/proc", "proc", 0, NULL);
     mount_fs("sysfs", "/sys", "sysfs", 0, NULL);
     mount_fs("devtmpfs", "/dev", "devtmpfs", 0, NULL);
     mkdir("/dev/pts", 0755);
     mount_fs("devpts", "/dev/pts", "devpts", 0, NULL);
     mount_fs("tmpfs", "/run", "tmpfs", 0, NULL);
 
-    // Даем ядру время проснуться и инициализировать драйверы устройств
     log_info("Waiting for devices to settle...");
     sleep(1);
 
@@ -67,8 +66,6 @@ int main() {
     make_dev("/dev/zero",    0666, 1, 5);
     make_dev("/dev/random",  0666, 1, 8);
     make_dev("/dev/urandom", 0666, 1, 9);
-    
-    make_dev("/dev/console", 0600, 5, 1);
 
     int fd = open("/dev/console", O_RDWR);
     if (fd >= 0) {
@@ -81,25 +78,79 @@ int main() {
     log_info("Mounting CD-ROM...");
     if (mount_fs("/dev/sr0", "/cdrom", "iso9660", MS_RDONLY, NULL) == 0) {
         log_info("Attaching loop0 device to rootfs.ext4...");
-        int loop_fd = open("/dev/loop0", O_RDONLY);
+        
+        mknod("/dev/loop0", S_IFBLK | 0600, makedev(7, 0));
+
+        int loop_fd = open("/dev/loop0", O_RDWR);
+        if (loop_fd < 0) {
+            fprintf(stderr, "[ERROR] Failed to open /dev/loop0: %s\n", strerror(errno));
+        }
+
         int img_fd = open("/cdrom/rootfs.ext4", O_RDONLY);
+        if (img_fd < 0) {
+            fprintf(stderr, "[ERROR] Failed to open /cdrom/rootfs.ext4: %s\n", strerror(errno));
+        }
+
         if (loop_fd >= 0 && img_fd >= 0) {
             if (ioctl(loop_fd, 0x4C00, img_fd) == 0) {
                 log_info("Successfully linked rootfs.ext4 to /dev/loop0");
-                log_info("Mounting main root filesystem...");
-                mount_fs("/dev/loop0", "/mnt", "ext4", MS_RDONLY, NULL);
-            } else {
-                fprintf(stderr, "[ERROR] ioctl LOOP_SET_FD failed: %s\n", strerror(errno));
+
+                close(loop_fd);
+                close(img_fd);
+                loop_fd = -1;
+                img_fd = -1;
+
+                log_info("Mounting main root filesystem (Read-Only layer)...");
+                
+                mkdir("/ro_root", 0755);
+                mkdir("/rw_root", 0755);
+                mkdir("/new_root", 0755);
+
+                if (mount_fs("/dev/loop0", "/ro_root", "ext4", MS_RDONLY, NULL) == 0) {
+                    log_info("Mounting tmpfs for writeable layer...");
+                    if (mount_fs("tmpfs", "/rw_root", "tmpfs", 0, NULL) == 0) {
+                        
+                        mkdir("/rw_root/upper", 0755);
+                        mkdir("/rw_root/work", 0755);
+
+                        log_info("Mounting OverlayFS...");
+                        const char *overlay_opts = "lowerdir=/ro_root,upperdir=/rw_root/upper,workdir=/rw_root/work";
+                        
+                        if (mount("overlay", "/new_root", "overlay", 0, overlay_opts) == 0) {
+                            log_info("OverlayFS successfully mounted on /new_root");
+
+                            log_info("Switching root to /new_root...");
+                            if (chroot("/new_root") == 0) {
+                                chdir("/");
+                                log_info("Successfully entered Live writeable rootfs!");
+
+                                mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+                                mount("proc", "/proc", "proc", 0, NULL);
+                                mount("sysfs", "/sys", "sysfs", 0, NULL);
+                                mkdir("/dev/pts", 0755);
+                                mount("devpts", "/dev/pts", "devpts", 0, NULL);
+                                mount("tmpfs", "/run", "tmpfs", 0, NULL);
+
+                            } else {
+                                fprintf(stderr, "[ERROR] Failed to chroot: %s\n", strerror(errno));
+                            }
+                        } else {
+                            fprintf(stderr, "[ERROR] Failed to mount overlay: %s\n", strerror(errno));
+                        }
+                    } else {
+                        fprintf(stderr, "[ERROR] Failed to mount tmpfs\n");
+                    }
+                } else {
+                    fprintf(stderr, "[ERROR] Failed to mount /dev/loop0 to /ro_root\n");
+                }
             }
-            close(loop_fd);
-            close(img_fd);
-        } else {
-            fprintf(stderr, "[ERROR] Couldn't open loop0 or rootfs.ext4\n");
         }
+        if (loop_fd >= 0) close(loop_fd);
+        if (img_fd >= 0) close(img_fd);
     }
 
     sethostname("fadlinux", strlen("fadlinux"));
-    setenv("PATH", "/bin:/sbin:/mnt/bin:/mnt/sbin", 1); // Добавили пути к нашему внешнему диску
+    setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
     setenv("HOME", "/root", 1);
     setenv("USER", "root", 1);
     setenv("SHELL", "/bin/sh", 0);
@@ -145,7 +196,7 @@ int main() {
             printf("  reboot            Reboot the system\n");
             printf("  poweroff          Power off the system\n");
             printf("\nExternal commands (in /bin):\n");
-            printf("  ls, cat, mkdir, rm, pwd\n");
+            printf("  ls, cat, mkdir, rm, pwd, fad_gui\n");
 
         } else if (strcmp(args[0], "cd") == 0) {
             const char *path = argc > 1 ? args[1] : "/";
@@ -185,7 +236,7 @@ int main() {
             pid_t pid = fork();
             if (pid == 0) {
                 execvp(args[0], args);
-                fprintf(stderr, "fuckass-shell: command not found: %s\n", args[0]);
+                fprintf(stderr, "fad-shell: command not found: %s\n", args[0]);
                 _exit(127);
             } else if (pid > 0) {
                 int status;

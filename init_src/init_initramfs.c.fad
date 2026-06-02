@@ -1,0 +1,226 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/mount.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/reboot.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <sys/wait.h>
+#include <linux/loop.h>
+
+void log_info(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    printf("[INIT] ");
+    vprintf(fmt, args);
+    printf("\n");
+    va_end(args);
+}
+
+static int setup_loop(const char *file, char *loopdev) {
+    int fd_file = open(file, O_RDONLY);
+    if (fd_file < 0) return -1;
+
+    int ctl = open("/dev/loop-control", O_RDWR);
+    if (ctl >= 0) {
+        int n = ioctl(ctl, LOOP_CTL_GET_FREE);
+        close(ctl);
+        if (n >= 0) {
+            snprintf(loopdev, 32, "/dev/loop%d", n);
+            mknod(loopdev, S_IFBLK | 0660, makedev(7, n));
+            int fd_loop = open(loopdev, O_RDWR);
+            if (fd_loop >= 0 && ioctl(fd_loop, LOOP_SET_FD, fd_file) == 0) {
+                close(fd_file);
+                close(fd_loop);
+                return 0;
+            }
+            if (fd_loop >= 0) close(fd_loop);
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        snprintf(loopdev, 32, "/dev/loop%d", i);
+        mknod(loopdev, S_IFBLK | 0660, makedev(7, i));
+        int fd_loop = open(loopdev, O_RDWR);
+        if (fd_loop < 0) continue;
+        if (ioctl(fd_loop, LOOP_SET_FD, fd_file) == 0) {
+            close(fd_file);
+            close(fd_loop);
+            return 0;
+        }
+        close(fd_loop);
+    }
+    close(fd_file);
+    return -1;
+}
+
+static int mount_fs(const char *source, const char *target, const char *type, unsigned long flags, const void *data) {
+    mkdir(target, 0755);
+    if (mount(source, target, type, flags, data) == 0) {
+        log_info("Mounted %s on %s (%s)", source, target, type);
+        return 0;
+    }
+    fprintf(stderr, "[ERROR] Failed to mount %s on %s (%s): %s\n", source, target, type, strerror(errno));
+    return -1;
+}
+
+int main() {
+    log_info("FAD initramfs init starting...");
+
+    mount_fs("proc", "/proc", "proc", 0, NULL);
+    mount_fs("sysfs", "/sys", "sysfs", 0, NULL);
+    mount_fs("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+
+    int fd = open("/dev/console", O_RDWR);
+    if (fd >= 0) {
+        dup2(fd, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
+        if (fd > 2) close(fd);
+    }
+
+    sethostname("fadlinux", strlen("fadlinux"));
+    setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
+    setenv("HOME", "/root", 1);
+
+    mkdir("/cdrom", 0755);
+    mkdir("/newroot", 0755);
+
+    log_info("Mounting CD-ROM /dev/sr0...");
+    int ret;
+    for (int i = 0; i < 10; i++) {
+        ret = mount("/dev/sr0", "/cdrom", "iso9660", MS_RDONLY, NULL);
+        if (ret == 0) break;
+        log_info("Waiting for CD-ROM (attempt %d)...", i + 1);
+        sleep(1);
+    }
+
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] Failed to mount CD-ROM after 10 attempts\n");
+        goto fallback;
+    }
+    log_info("CD-ROM mounted at /cdrom");
+
+    if (access("/cdrom/rootfs.ext4", F_OK) != 0) {
+        fprintf(stderr, "[ERROR] rootfs.ext4 not found on CD-ROM\n");
+        goto fallback;
+    }
+
+    log_info("Loop mounting rootfs.ext4...");
+    char loopdev[32] = {0};
+    if (setup_loop("/cdrom/rootfs.ext4", loopdev) != 0) {
+        fprintf(stderr, "[ERROR] Failed to setup loop device for rootfs.ext4\n");
+        goto fallback;
+    }
+    log_info("Using loop device: %s", loopdev);
+    if (mount(loopdev, "/newroot", "ext4", MS_RDONLY, NULL) != 0) {
+        fprintf(stderr, "[ERROR] Failed to mount loop device %s: %s\n", loopdev, strerror(errno));
+        goto fallback;
+    }
+    log_info("rootfs.ext4 mounted at /newroot");
+
+    mount_fs("proc", "/newroot/proc", "proc", 0, NULL);
+    mount_fs("sysfs", "/newroot/sys", "sysfs", 0, NULL);
+    mount_fs("devtmpfs", "/newroot/dev", "devtmpfs", 0, NULL);
+
+    if (access("/newroot/init", X_OK) != 0) {
+        fprintf(stderr, "[ERROR] /newroot/init not found or not executable\n");
+        goto fallback;
+    }
+
+log_info("Switching to new root via chroot...");
+
+    if (chdir("/newroot") != 0) {
+        fprintf(stderr, "[ERROR] chdir /newroot failed: %s\n", strerror(errno));
+        goto fallback;
+    }
+
+    if (chroot(".") != 0) {
+        fprintf(stderr, "[ERROR] chroot failed: %s\n", strerror(errno));
+        goto fallback;
+    }
+
+    if (chdir("/") != 0) {
+        fprintf(stderr, "[ERROR] chdir / failed: %s\n", strerror(errno));
+        goto fallback;
+    }
+
+    log_info("Switching to real root init...");
+
+    char * const argv[] = {"/init", NULL};
+    execv("/init", argv);
+
+    fprintf(stderr, "[ERROR] Failed to exec /init: %s\n", strerror(errno));
+
+fallback:
+    log_info("Falling back to initramfs shell...");
+    printf("\n  Welcome to FAD Linux (initramfs fallback)\n");
+    printf("  Type 'help' for available commands.\n\n");
+
+    char line[4096];
+    char *args[128];
+
+    while (1) {
+        char cwd[256];
+        if (getcwd(cwd, sizeof(cwd)) == NULL) snprintf(cwd, sizeof(cwd), "?");
+        printf("fad:%s# ", cwd);
+        fflush(stdout);
+        if (fgets(line, sizeof(line), stdin) == NULL) break;
+        line[strcspn(line, "\n")] = 0;
+
+        int argc = 0;
+        char *tok = strtok(line, " \t");
+        while (tok && argc < 127) {
+            args[argc++] = tok;
+            tok = strtok(NULL, " \t");
+        }
+        args[argc] = NULL;
+        if (argc == 0) continue;
+
+        if (strcmp(args[0], "help") == 0) {
+            printf("Built-in: help cd echo export clear reboot poweroff\n");
+            printf("External: ls cat mkdir rm pwd\n");
+        } else if (strcmp(args[0], "cd") == 0) {
+            const char *path = argc > 1 ? args[1] : "/";
+            if (chdir(path) != 0)
+                fprintf(stderr, "cd: %s: %s\n", path, strerror(errno));
+        } else if (strcmp(args[0], "echo") == 0 && argc > 1) {
+            for (int i = 1; i < argc; i++) {
+                printf("%s", args[i]);
+                if (i < argc - 1) printf(" ");
+            }
+            printf("\n");
+        } else if (strcmp(args[0], "reboot") == 0) {
+            sync();
+            reboot(RB_AUTOBOOT);
+        } else if (strcmp(args[0], "poweroff") == 0) {
+            sync();
+            reboot(RB_POWER_OFF);
+        } else if (strcmp(args[0], "clear") == 0) {
+            printf("\033[H\033[J");
+        } else {
+            pid_t pid = fork();
+            if (pid == 0) {
+                execvp(args[0], args);
+                fprintf(stderr, "fad-shell: command not found: %s\n", args[0]);
+                _exit(127);
+            } else if (pid > 0) {
+                int status;
+                waitpid(pid, &status, 0);
+            } else {
+                perror("fork failed");
+            }
+        }
+    }
+
+    sync();
+    reboot(RB_POWER_OFF);
+    return 0;
+}
