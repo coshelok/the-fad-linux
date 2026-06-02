@@ -10,14 +10,8 @@ boot_staging/
 *.ext4
 *.iso
 *.cpio.gz
-bzImage
 vmlinuz
-core.img
 init
-
-# Игнорируем мусорные файлы nano
-*.save
-*.bak
 
 # Исключение: Cargo-конфиг для статической сборки Rust ОБЯЗАН быть в Git
 !.cargo/config.toml
