@@ -155,15 +155,6 @@ if [ -f "$PROJECT_DIR/fad_utils/fadfetch" ]; then
     chmod +x "$TARGET_DIR/bin/fadfetch"
 fi
 
-log "Compiling ultra-custom FAD-UI Graphical Server..."
-if [ -f "$PROJECT_DIR/fad_gui.c" ]; then
-    gcc -O3 -static "$PROJECT_DIR/fad_gui.c" -o "$TARGET_DIR/bin/fad_gui"
-    chmod +x "$TARGET_DIR/bin/fad_gui"
-    log "[SUCCESS] FAD-UI binary compiled and placed into /bin/fad_gui"
-else
-    log "[ERROR] fad_gui.c not found in project directory!"
-fi
-
 # ========== System Config ==========
 log "Generating system configuration..."
 cat > "$TARGET_DIR/etc/passwd" <<EOF

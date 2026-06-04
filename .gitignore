@@ -1,13 +1,11 @@
 # Игнорируем тяжелые папки с исходниками ядра и инструментами сборки
 kernel/
-grub_build/
 build_tool/
 toolchain/
 boot_staging/
 **/target/
 
 # Игнорируем бинарные слепки дисков и ядра
-*.ext4
 *.iso
 *.cpio.gz
 *.bak

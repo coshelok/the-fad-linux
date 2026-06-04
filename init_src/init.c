@@ -77,7 +77,7 @@ int main() {
 
     log_info("Mounting CD-ROM...");
     if (mount_fs("/dev/sr0", "/cdrom", "iso9660", MS_RDONLY, NULL) == 0) {
-        log_info("Attaching loop0 device to rootfs.ext4...");
+        log_info("Attaching loop0 device to rootfs.sfs...");
         
         mknod("/dev/loop0", S_IFBLK | 0600, makedev(7, 0));
 
@@ -86,14 +86,14 @@ int main() {
             fprintf(stderr, "[ERROR] Failed to open /dev/loop0: %s\n", strerror(errno));
         }
 
-        int img_fd = open("/cdrom/rootfs.ext4", O_RDONLY);
+        int img_fd = open("/cdrom/boot/rootfs.sfs", O_RDONLY);
         if (img_fd < 0) {
-            fprintf(stderr, "[ERROR] Failed to open /cdrom/rootfs.ext4: %s\n", strerror(errno));
+            fprintf(stderr, "[ERROR] Failed to open /cdrom/rootfs.sfs: %s\n", strerror(errno));
         }
 
         if (loop_fd >= 0 && img_fd >= 0) {
             if (ioctl(loop_fd, 0x4C00, img_fd) == 0) {
-                log_info("Successfully linked rootfs.ext4 to /dev/loop0");
+                log_info("Successfully linked rootfs.sfs to /dev/loop0");
 
                 close(loop_fd);
                 close(img_fd);
@@ -106,7 +106,7 @@ int main() {
                 mkdir("/rw_root", 0755);
                 mkdir("/new_root", 0755);
 
-                if (mount_fs("/dev/loop0", "/ro_root", "ext4", MS_RDONLY, NULL) == 0) {
+                if (mount_fs("/dev/loop0", "/ro_root", "squashfs", MS_RDONLY, NULL) == 0) {
                     log_info("Mounting tmpfs for writeable layer...");
                     if (mount_fs("tmpfs", "/rw_root", "tmpfs", 0, NULL) == 0) {
                         
@@ -130,7 +130,14 @@ int main() {
                                 mkdir("/dev/pts", 0755);
                                 mount("devpts", "/dev/pts", "devpts", 0, NULL);
                                 mount("tmpfs", "/run", "tmpfs", 0, NULL);
-
+                                
+                                int new_fd = open("/dev/console", O_RDWR);
+                                if (new_fd >= 0) {
+                                    dup2(new_fd, 0); // stdin
+                                    dup2(new_fd, 1); // stdout
+                                    dup2(new_fd, 2); // stderr
+                                    if (new_fd > 2) close(new_fd);
+                                }
                             } else {
                                 fprintf(stderr, "[ERROR] Failed to chroot: %s\n", strerror(errno));
                             }
@@ -165,14 +172,20 @@ int main() {
 
     char line[4096];
     char *args[128];
+    char cwd[256];
 
     while (1) {
-        char cwd[256];
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+
         if (getcwd(cwd, sizeof(cwd)) == NULL) snprintf(cwd, sizeof(cwd), "?");
 
         printf("fad:%s# ", cwd);
         fflush(stdout);
-        if (fgets(line, sizeof(line), stdin) == NULL) break;
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            printf("\nUse 'poweroff' command to shutdown the system.\n");
+            clearerr(stdin);
+            continue;
+        }
 
         line[strcspn(line, "\n")] = 0;
 
@@ -196,7 +209,7 @@ int main() {
             printf("  reboot            Reboot the system\n");
             printf("  poweroff          Power off the system\n");
             printf("\nExternal commands (in /bin):\n");
-            printf("  ls, cat, mkdir, rm, pwd, fad_gui\n");
+            printf("  ls, cat, mkdir, rm, pwd\n");
 
         } else if (strcmp(args[0], "cd") == 0) {
             const char *path = argc > 1 ? args[1] : "/";
